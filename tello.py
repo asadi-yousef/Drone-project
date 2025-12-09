@@ -8,6 +8,7 @@ import numpy as np
 from collections import deque, defaultdict
 from math import hypot
 import os
+import keyPressModule as kp
 
 # ---------- CONFIG ----------
 LOCAL_UDP_PORT = 9000
@@ -204,68 +205,166 @@ class TelloController:
         if ok:
             time.sleep(1.8)
         return ok
+    # Inside the TelloController class:
+    def send_rc_control(self, lr, fb, ud, yv):
+        """
+        Sends the 'rc a b c d' command for continuous movement.
+        lr: Left/Right (-100 to 100)
+        fb: Forward/Backward (-100 to 100)
+        ud: Up/Down (-100 to 100)
+        yv: Yaw velocity (-100 to 100)
+        """
+        if not self.in_flight:
+            # We should not send movement commands if not in flight
+            return
+            
+        command = f"rc {lr} {fb} {ud} {yv}"
+        # For RC commands, we don't wait for 'ok', just send and forget (non-blocking)
+        try:
+            self.sock.sendto(command.encode(), self.tello_address)
+        except Exception as e:
+            # Silently fail for continuous RC commands to avoid excessive console output
+            pass
 
 # ----------------------------------------------------------------------
 #                             MAIN FUNCTION
 # ----------------------------------------------------------------------
 
-def main():
-    """Initializes the Tello controller, starts the video stream, and displays it."""
+def get_keyboard_input(tello_controller):
+    """Checks for key presses and sends commands to the TelloController."""
+    lr, fb, ud, yv = 0, 0, 0, 0
+    # Use a safe speed for manual control (10-100)
+    speed = 50 
     
-    # 1. Initialize the Tello controller (handles command/response on UDP 9000)
+    # Check for Takeoff/Land
+    if kp.getkey("h"): # 'h' for Hover/Takeoff
+        if not tello_controller.in_flight:
+            print("🚀 Taking off...")
+            tello_controller.safe_takeoff()
+    elif kp.getkey("l"): # 'l' for Land
+        if tello_controller.in_flight:
+            print("🛬 Landing...")
+            tello_controller.safe_land()
+            
+    if not tello_controller.in_flight:
+        return [0, 0, 0, 0] # Drone must be in flight for RC control
+    
+    # Movement: Left/Right (lr)
+    if kp.getkey("LEFT"): 
+        lr = -speed
+    elif kp.getkey("RIGHT"): 
+        lr = speed
+
+    # Movement: Forward/Backward (fb)
+    if kp.getkey("UP"): 
+        fb = speed
+    elif kp.getkey("DOWN"): 
+        fb = -speed
+
+    # Movement: Up/Down (ud)
+    if kp.getkey("w"): 
+        ud = speed
+    elif kp.getkey("s"): 
+        ud = -speed
+
+    # Movement: Yaw Velocity (yv)
+    if kp.getkey("a"): 
+        yv = -speed
+    elif kp.getkey("d"): 
+        yv = speed
+
+    # Flips (requires good battery and altitude)
+    if kp.getkey("f"):
+        # Example flip: forward
+        print("🤸 Performing forward flip...")
+        tello_controller.send_command('flip f')
+        time.sleep(COMMAND_COOLDOWN) # Wait for flip to complete
+
+    # Return the four RC control values
+    return [lr, fb, ud, yv]
+    
+# ----------------------------------------------------------------------
+#                                MAIN FUNCTION
+# ----------------------------------------------------------------------
+
+def main():
+    """Initializes the Tello controller, starts the video stream, and displays it with keyboard control."""
+    
+    # 1. Initialize the Tello controller
     tello = TelloController()
     
+    # 1b. Initialize Pygame for key presses
+    kp.init() 
+    
     # 2. Enter SDK Mode and send 'streamon' command
-    # This prepares the drone to send video data to the default port 11111
     if not tello.start_sdk_mode():
         print("Fatal error: Could not establish communication with Tello. Aborting.")
         tello.stop()
         return
 
     # 3. Initialize OpenCV Video Capture
-    # We use cv2.CAP_FFMPEG as the backend for decoding H.264 streams
     cap = cv2.VideoCapture(VIDEO_STREAM_URL, cv2.CAP_FFMPEG)
-    
-    # Set buffer size to a low value to reduce stream latency (lag)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 2) 
 
     if not cap.isOpened():
         print("-" * 50)
         print(f"❌ Error: Failed to open video stream on {VIDEO_STREAM_URL}.")
-        print("Check if port 11111 is blocked by your Windows Firewall or Antivirus.")
-        print("Also ensure the drone is on and you are connected to its Wi-Fi.")
+        print("Check Tello connection and firewall.")
         print("-" * 50)
         tello.stop()
         return
 
+    # Image Capture setup
+    image_count = 0
+    capture_folder = "tello_captures"
+    os.makedirs(capture_folder, exist_ok=True)
+    last_rc_command_time = time.time()
+
     try:
-        print("▶️ Live video stream active. Press 'q' in the video window to quit.")
+        print("▶️ Live video stream active. Press 'q' to quit, 'h' to takeoff, 'l' to land, 'p' to capture image.")
         
         while True:
-            # 4. Read the frame from the stream
+            # Read the frame
             ret, frame = cap.read()
 
             if not ret:
-                # If frame read fails, print a warning and continue trying
-                # NOTE: For Tello, sometimes the first few frames fail to decode.
-                print("⚠️ Frame read failed. Retrying...")
                 time.sleep(0.01)
                 continue
 
-            # 5. Display the frame
-            # Resizing to a manageable size (e.g., 480x360)
+            # --- KEYBOARD CONTROL AND COMMANDS ---
+            
+            # Get control values and handle takeoff/land/flip
+            rc_values = get_keyboard_input(tello) 
+            
+            # Send RC Control command (non-blocking)
+            lr, fb, ud, yv = rc_values
+            tello.send_rc_control(lr, fb, ud, yv)
+            last_rc_command_time = time.time()
+            
+            # Image Capture (Key 'p')
+            if kp.getkey("p"):
+                filename = os.path.join(capture_folder, f"tello_capture_{image_count:04d}.png")
+                cv2.imwrite(filename, frame)
+                print(f"📸 Image captured: {filename}")
+                image_count += 1
+                time.sleep(0.3) # Cooldown to avoid multiple captures on a single press
+
+            # --- VIDEO DISPLAY ---
+            
+            # Display current Tello state on the frame
+            status_text = f"Flight: {'In Air' if tello.in_flight else 'Landed'} | CMD: rc {lr} {fb} {ud} {yv}"
+            cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Display the frame
             display_frame = cv2.resize(frame, (480, 360))
             cv2.imshow("Tello Live Video Feed (Press 'q' to quit)", display_frame)
 
-            # 6. Handle user input
+            # Handle user input (OpenCV window 'q' key)
             key = cv2.waitKey(1) & 0xFF
-            
-            # Quitting command
             if key == ord('q'):
                 break
 
-            # Small delay to yield CPU time
-            time.sleep(1/60)
+            time.sleep(1/60) # Frame rate governor
 
     except KeyboardInterrupt:
         print("Program interrupted by user (Ctrl+C).")
@@ -273,14 +372,14 @@ def main():
         # 7. Cleanup
         print("Stopping video stream and controller...")
         tello.send_command('streamoff')
+        # Ensure the drone lands if it's still flying
+        if tello.in_flight:
+            tello.safe_land() 
         cap.release()
         cv2.destroyAllWindows()
         tello.stop()
         print("Program finished.")
 
 if __name__ == '__main__':
-    # Ensure all necessary folders/files for your ORB-SLAM log exist if you plan to use it later
-    # if not os.path.exists(os.path.dirname(ORB_SLAM_LOG_FILE)):
-    #     os.makedirs(os.path.dirname(ORB_SLAM_LOG_FILE))
-        
+
     main()

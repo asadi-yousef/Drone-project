@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, Dict
+from mpl_toolkits.mplot3d import Axes3D 
 
 class MotionEstimator:
     """
@@ -22,13 +23,9 @@ class MotionEstimator:
         self.focal_length = focal_length
         self.principal_point = principal_point
         
-        # Initialize feature detector (ORB is fast, SIFT is more accurate)
         self.detector = cv2.ORB_create(nfeatures=2000)
-        # Alternative: self.detector = cv2.SIFT_create()
         
-        # Initialize feature matcher
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        # For SIFT, use: cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
     
     def _get_camera_matrix(self, img_shape):
         """Create camera matrix if not provided."""
@@ -117,10 +114,9 @@ class MotionEstimator:
                 - 'num_inliers': number of inlier matches
                 - 'matched_points': (pts1, pts2) matched point coordinates
         """
-        # Get camera matrix
         K = self._get_camera_matrix(img1.shape)
         
-        # Detect and match features
+        
         pts1, pts2, matches = self.detect_and_match_features(img1, img2)
         
         # Estimate essential matrix
@@ -250,12 +246,83 @@ def print_motion_results(result: Dict):
     print("      without scale information (depth or known object size)")
     print("=" * 60)
 
+def plot_relative_motion(result, normalize_translation=True):
+    """
+    Visualize the motion between two frames as a 3D line segment.
+    
+    Camera 1 is at the origin, camera 2 is at translation_vector (optionally normalized).
+    """
+    t = result['translation_vector'].ravel().astype(float)
 
-# Example usage
+    # Monocular VO: t is up to scale, so we usually normalize it for visualization
+    if normalize_translation:
+        norm = np.linalg.norm(t) + 1e-8
+        t = t / norm
+
+    # Camera 1 center at origin
+    C1 = np.array([0.0, 0.0, 0.0])
+    # Camera 2 center at t (in camera-1 coordinates)
+    C2 = t
+
+    xs = [C1[0], C2[0]]
+    ys = [C1[1], C2[1]]
+    zs = [C1[2], C2[2]]
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Draw line from cam1 to cam2
+    ax.plot(xs, ys, zs, marker='o')
+    ax.scatter(xs[0], ys[0], zs[0], s=60, label='Camera 1 (frame 1)')
+    ax.scatter(xs[1], ys[1], zs[1], s=60, label='Camera 2 (frame 2)')
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('Relative Motion Between Two Frames')
+    ax.legend()
+    ax.grid(True)
+    ax.view_init(elev=25, azim=-60)  # angle of view, you can change this
+    plt.tight_layout()
+    plt.show()
+
+def plot_motion_map_single(result, normalize=True):
+    """
+    Top-down 'map' of motion between two frames.
+    X axis = left/right, Z axis = forward/back (camera-1 coordinates).
+    """
+    t = result['translation_vector'].ravel().astype(float)
+
+    if normalize:
+        norm = np.linalg.norm(t) + 1e-8
+        t = t / norm
+
+    # Camera 1 at origin
+    x1, z1 = 0.0, 0.0
+    # Camera 2 at translation direction
+    x2, z2 = t[0], t[2]
+
+    plt.figure(figsize=(5, 5))
+    # Draw arrow from cam1 to cam2
+    plt.quiver(x1, z1, x2, z2, angles='xy', scale_units='xy', scale=1)
+    plt.scatter([x1], [z1], s=60, label='Frame 1 (start)')
+    plt.scatter([x2], [z2], s=60, label='Frame 2 (end)')
+
+    plt.axhline(0, color='gray', linewidth=0.5)
+    plt.axvline(0, color='gray', linewidth=0.5)
+    plt.xlabel('X (left/right, arbitrary units)')
+    plt.ylabel('Z (forward/back, arbitrary units)')
+    plt.title('Top-down Motion Map (single step)')
+    plt.legend()
+    plt.grid(True)
+    plt.axis('equal')
+    plt.tight_layout()
+    plt.show()
+
 if __name__ == "__main__":
-    # Load two consecutive frames
-    img1 = cv2.imread('images/frame1.jpeg')
-    img2 = cv2.imread('images/frame2.jpeg')
+    
+    img1 = cv2.imread('images/trans1.jpeg')
+    img2 = cv2.imread('images/trans2.jpeg')
     
     if img1 is None or img2 is None:
         print("Error: Could not load images. Please provide 'frame1.jpg' and 'frame2.jpg'")
@@ -268,8 +335,19 @@ if __name__ == "__main__":
         M = cv2.getRotationMatrix2D((320, 240), 5, 1.0)
         img2 = cv2.warpAffine(img2, M, (640, 480))
     
-    # Initialize estimator
-    estimator = MotionEstimator(focal_length=800)
+    h, w = img1.shape[:2]
+
+    # Very rough approximation
+    f = 0.9 * max(w, h)   # focal length in pixels (rough guess)
+    cx, cy = w / 2, h / 2
+
+    camera_matrix = np.array([
+        [f,   0, cx],
+        [0,   f, cy],
+        [0,   0,  1]
+    ], dtype=np.float64)
+
+    estimator = MotionEstimator(camera_matrix=camera_matrix)
     
     # Estimate motion
     try:
@@ -281,6 +359,9 @@ if __name__ == "__main__":
         # Visualize matches
         pts1, pts2 = result['inlier_points']
         estimator.visualize_matches(img1, img2, pts1, pts2, num_display=50)
+
+        plot_relative_motion(result)
+        plot_motion_map_single(result)
         
     except ValueError as e:
         print(f"Error: {e}")
