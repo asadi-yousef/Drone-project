@@ -128,7 +128,8 @@ class MotionEstimator:
         )
         
         # Count inliers
-        num_inliers = np.sum(mask)
+        num_inliers = int((mask.ravel() == 1).sum())
+
         
         # Filter points to only inliers
         pts1_inliers = pts1[mask.ravel() == 1]
@@ -138,7 +139,16 @@ class MotionEstimator:
         _, R, t, pose_mask = cv2.recoverPose(E, pts1_inliers, pts2_inliers, K)
         
         # Convert rotation matrix to Euler angles (roll, pitch, yaw)
-        euler_angles = self._rotation_matrix_to_euler(R)
+        # Convert rotation matrix to Euler angles (roll, pitch, yaw)
+        # Use inverse if you want the camera motion rather than the "world" transform
+        euler_angles = self._rotation_matrix_to_euler_y_up(R.T)
+        e1 = self._rotation_matrix_to_euler(R)
+        e2 = self._rotation_matrix_to_euler(R.T)
+
+        print("Euler from R   :", e1)
+        print("Euler from R.T :", e2)
+
+
         
         result = {
             'rotation_matrix': R,
@@ -171,6 +181,13 @@ class MotionEstimator:
             yaw = 0
         
         return np.degrees([roll, pitch, yaw])
+    def _rotation_matrix_to_euler_y_up(self, R):
+        # Convert from OpenCV camera coords (x right, y down, z forward)
+        # to a y-up convention by flipping y axis.
+        S = np.diag([1, -1, 1])
+        R2 = S @ R @ S
+        return self._rotation_matrix_to_euler(R2)
+
     
     def visualize_matches(self, img1, img2, pts1, pts2, num_display=50):
         """
@@ -321,8 +338,8 @@ def plot_motion_map_single(result, normalize=True):
 
 if __name__ == "__main__":
     
-    img1 = cv2.imread('images/trans1.jpeg')
-    img2 = cv2.imread('images/trans2.jpeg')
+    img1 = cv2.imread('images/000164.png')
+    img2 = cv2.imread('images/000165.png')
     
     if img1 is None or img2 is None:
         print("Error: Could not load images. Please provide 'frame1.jpg' and 'frame2.jpg'")

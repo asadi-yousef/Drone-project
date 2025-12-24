@@ -2,11 +2,11 @@ from djitellopy import tello
 import keyPressModule as kp
 from time import  sleep
 
-
+"""
 kp.init()
 me = tello.Tello()
 me.connect()
-print(me.get_battery())
+print(me.get_battery())"""
 
 def getkeyboardInput():
     lr,fb,ud,yv = 0, 0 ,0 ,0
@@ -33,8 +33,19 @@ def take_off_land():
     elif kp.getkey("l"):
         me.land()
 
-while True:
+"""while True:
     take_off_land()
     values = getkeyboardInput()
     me.send_rc_control(values[0],values[1],values[2],values[3])
-    sleep(0.05)
+    sleep(0.05)"""
+
+if __name__ == "__main__":
+    import cv2
+    import cv2.aruco as aruco
+
+    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+    marker_id = 1
+    marker_size = 600  # pixels
+
+    marker = aruco.generateImageMarker(aruco_dict, marker_id, marker_size)
+    cv2.imwrite("aruco_4x4_id1.png", marker)
