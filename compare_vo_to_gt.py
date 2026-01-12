@@ -1,233 +1,278 @@
 import os
-import glob
-import argparse
-import numpy as np
 import cv2
+import numpy as np
 import matplotlib.pyplot as plt
 
-# IMPORTANT:
-# Save your pasted estimator code as: motion_estimator.py
-# so this import works.
+# ==========================
+# CONFIG SECTION (EDIT THIS)
+# ==========================
+
+VIDEO_PATH = "test.mp4"     # <-- path to your video
+MAX_FRAMES = 0                     # 0 = process all frames
+FRAME_SKIP = 2                    # use every Nth frame
+ARUCO_ID = 0                       # marker id
+ARUCO_CELL_CM = 2.5                # each cell length in cm
+ARUCO_TOTAL_CELLS = 6              # 4 inner + 2 border (standard assumption)
+
+# ==========================
+# IMPORT YOUR ESTIMATOR
+# ==========================
+
 from motion_estimator import MotionEstimator
 
-# =========================
-# USER CONFIGURATION
-# =========================
 
-FRAMES_DIR = "images"   # folder with 000000.png, 000001.png, ...
-GT_PATH = "camera_poses.txt"  # ground-truth poses file
-
-START_IDX = 0            # first frame index to use
-END_IDX = None           # last frame index (None = use all)
-
-USE_GT_SCALE = False      # False = direction-only VO (no scale)
-VERBOSE = True           # print debug info
-MAX_PAIRS = None       # limit number of pairs processed (None = all)
-
-def load_gt_poses(gt_path: str):
-    """
-    Loads GT poses from a whitespace/csv-like text file.
-
-    Expected columns (at least):
-      frame x y z roll pitch yaw
-
-    Returns:
-      frames (N,), positions (N,3)
-    """
-    # Try whitespace-delimited with header
-    data = np.genfromtxt(gt_path, dtype=None, encoding=None, names=True)
-
-    # Normalize common column name variants
-    colnames = set(data.dtype.names)
-
-    def pick(name_options):
-        for n in name_options:
-            if n in colnames:
-                return n
-        raise ValueError(f"Could not find any of columns: {name_options} in {colnames}")
-
-    c_frame = pick(["frame", "Frame", "idx", "index"])
-    c_x = pick(["x", "X"])
-    c_y = pick(["y", "Y"])
-    c_z = pick(["z", "Z"])
-
-    frames = np.asarray(data[c_frame], dtype=int)
-    positions = np.vstack([data[c_x], data[c_y], data[c_z]]).T.astype(np.float64)
-    return frames, positions
-
-
-def list_frames(frames_dir: str, ext: str = "png"):
-    files = sorted(glob.glob(os.path.join(frames_dir, f"*.{ext}")))
-    if len(files) < 2:
-        raise ValueError(f"Need at least 2 frames in {frames_dir}, found {len(files)}")
-    return files
-
-
-def build_camera_matrix_from_first_frame(img_path: str):
-    img = cv2.imread(img_path)
-    if img is None:
-        raise ValueError(f"Could not read image: {img_path}")
-    h, w = img.shape[:2]
-    f = 0.9 * max(w, h)  # same rough guess style you used
+def build_rough_camera_matrix(frame_shape):
+    h, w = frame_shape[:2]
+    f = 0.9 * max(w, h)
     cx, cy = w / 2.0, h / 2.0
-    K = np.array([[f, 0, cx],
-                  [0, f, cy],
-                  [0, 0, 1]], dtype=np.float64)
-    return K
+    return np.array([[f, 0, cx],
+                     [0, f, cy],
+                     [0, 0, 1]], dtype=np.float64)
 
 
-def integrate_trajectory(estimator: MotionEstimator, frame_files, gt_frames, gt_positions,
-                         use_gt_scale=True, max_pairs=None, verbose=False):
+def se3_to_T(R, t):
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = t.reshape(3)
+    return T
+
+
+def T_inv(T):
+    R = T[:3, :3]
+    t = T[:3, 3]
+    Ti = np.eye(4, dtype=np.float64)
+    Ti[:3, :3] = R.T
+    Ti[:3, 3] = -R.T @ t
+    return Ti
+
+
+def camera_center_from_marker_pose(rvec, tvec):
+    R, _ = cv2.Rodrigues(rvec.reshape(3, 1))
+    t = tvec.reshape(3, 1)
+    return (-R.T @ t).reshape(3)
+
+
+def detect_aruco_camera_center(frame, aruco_detector, K, dist, marker_length_m, wanted_id):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    corners, ids, _ = aruco_detector.detectMarkers(gray)
+    if ids is None:
+        return None
+
+    ids = ids.flatten()
+    idxs = np.where(ids == wanted_id)[0]
+    if len(idxs) == 0:
+        return None
+
+    i = int(idxs[0])
+
+    # ArUco returns corners as (1,4,2) for each marker in Python
+    corner_2d = corners[i].reshape(4, 2)
+
+    rvec, tvec = estimate_pose_square_marker_solvepnp(corner_2d, marker_length_m, K, dist)
+    if rvec is None:
+        return None
+
+    return camera_center_from_marker_pose(rvec, tvec)
+
+
+def estimate_pose_square_marker_solvepnp(corner_2d, marker_length_m, K, dist):
     """
-    Integrates relative motions into a global camera trajectory.
-
-    Assumption (standard OpenCV convention):
-      estimator returns relative pose cam1 -> cam2 such that: X2 = R * X1 + t
+    corner_2d: (4,2) image points in the same order as returned by ArUco (tl, tr, br, bl).
+    Returns rvec, tvec for marker->camera:
+      X_cam = R * X_marker + t
     """
+    # 3D marker corners in marker frame (origin at marker center)
+    half = marker_length_m / 2.0
+    objp = np.array([
+        [-half,  half, 0.0],  # top-left
+        [ half,  half, 0.0],  # top-right
+        [ half, -half, 0.0],  # bottom-right
+        [-half, -half, 0.0],  # bottom-left
+    ], dtype=np.float32)
 
-    gt_map = {int(f): gt_positions[i] for i, f in enumerate(gt_frames)}
+    imgp = np.asarray(corner_2d, dtype=np.float32).reshape(-1, 2)
 
-    # World-from-camera rotation and camera position in world
-    R_wc = np.eye(3, dtype=np.float64)
-    p_w  = np.zeros(3, dtype=np.float64)
+    # SOLVEPNP_IPPE_SQUARE is designed for square planar markers (good for ArUco).
+    # If your OpenCV build doesn't support it, fallback to SOLVEPNP_ITERATIVE. :contentReference[oaicite:2]{index=2}
+    try:
+        ok, rvec, tvec = cv2.solvePnP(objp, imgp, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    except Exception:
+        ok, rvec, tvec = cv2.solvePnP(objp, imgp, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
 
-    est_positions = [p_w.copy()]
-
-    num_pairs = len(frame_files) - 1
-    
-    if max_pairs is not None:
-        num_pairs = min(num_pairs, int(max_pairs))
-
-    for i in range(num_pairs):
-        f1 = frame_files[i]
-        f2 = frame_files[i + 1]
-
-        img1 = cv2.imread(f1)
-        img2 = cv2.imread(f2)
-        if img1 is None or img2 is None:
-            if verbose:
-                print(f"[WARN] Skipping unreadable pair: {f1}, {f2}")
-            est_positions.append(p_w.copy())
-            continue
-
-        try:
-            result = estimator.estimate_motion(img1, img2)
-        except Exception as e:
-            if verbose:
-                print(f"[WARN] Motion estimation failed on pair {i}: {e}")
-            est_positions.append(p_w.copy())
-            continue
-
-        # Relative motion cam1 -> cam2
-        R_rel = result["rotation_matrix"].astype(np.float64)
-        t_rel = result["translation_vector"].reshape(3).astype(np.float64)
-
-        # --- Scale using GT step length (optional but needed for metric comparison) ---
-        scale = 1.0
-        if use_gt_scale:
-            idx1 = int(os.path.splitext(os.path.basename(f1))[0])
-            idx2 = int(os.path.splitext(os.path.basename(f2))[0])
-            if idx1 in gt_map and idx2 in gt_map:
-                gt_step = np.linalg.norm(gt_map[idx2] - gt_map[idx1])
-                scale = float(gt_step) if gt_step > 1e-12 else 1.0
-
-        t_rel = t_rel * scale
-
-        # --- Heuristic to reduce sign flip in mostly-forward motion sequences ---
-        # If your camera "forward" is +Z (common OpenCV camera coords), enforce it.
-        # If this makes it worse, delete these 2 lines.
-        if t_rel[2] < 0:
-            t_rel = -t_rel
-
-        # --- Compose into world ---
-        # IMPORTANT: t_rel is in camera-1 coordinates -> rotate it into world
-        p_w = p_w + (R_wc @ t_rel)
-
-        # Update world-from-camera rotation
-        R_wc = R_wc @ R_rel
-
-        est_positions.append(p_w.copy())
-
-        if verbose and (i % 20 == 0):
-            print(f"[INFO] pair {i}/{num_pairs}: "
-                  f"inliers={result.get('num_inliers')} matches={result.get('total_matches')} "
-                  f"scale={scale:.6f}")
-
-    est_positions = np.vstack(est_positions)
-
-    # --- Build comparable GT segment aligned to processed frames ---
-    gt_used = []
-    for k in range(num_pairs + 1):
-        idx = int(os.path.splitext(os.path.basename(frame_files[k]))[0])
-        if idx in gt_map:
-            gt_used.append(gt_map[idx])
-        else:
-            gt_used.append(gt_used[-1] if gt_used else np.zeros(3, dtype=np.float64))
-    gt_used = np.vstack(gt_used)
-
-    # Align both so they start at origin
-    gt_used = gt_used - gt_used[0]
-    est_positions = est_positions - est_positions[0]
-
-    return est_positions, gt_used
+    if not ok:
+        return None, None
+    return rvec, tvec
 
 
-def plot_3d(gt_xyz, est_xyz, title="Trajectory: Estimated vs Ground Truth"):
-    fig = plt.figure(figsize=(10, 8))
+def plot_trajectories(vo, aruco):
+    fig = plt.figure(figsize=(10, 7))
     ax = fig.add_subplot(111, projection="3d")
 
-    ax.plot(gt_xyz[:, 0], gt_xyz[:, 1], gt_xyz[:, 2], label="Ground Truth")
-    ax.plot(est_xyz[:, 0], est_xyz[:, 1], est_xyz[:, 2], label="Estimated (VO)")
+    if len(vo) > 0:
+        ax.plot(vo[:, 0], vo[:, 1], vo[:, 2], label="VO (ORB + Essential)")
+        ax.scatter(vo[0, 0], vo[0, 1], vo[0, 2], s=60)
 
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    ax.set_title(title)
+    if len(aruco) > 0:
+        ax.plot(aruco[:, 0], aruco[:, 1], aruco[:, 2], label="ArUco (metric)")
+        ax.scatter(aruco[0, 0], aruco[0, 1], aruco[0, 2], s=60)
+
+    ax.set_xlabel("X (meters)")
+    ax.set_ylabel("Y (meters)")
+    ax.set_zlabel("Z (meters)")
     ax.legend()
     ax.grid(True)
     plt.tight_layout()
     plt.show()
 
+# ==========================
+# MAIN PIPELINE
+# ==========================
 
-def main():
-    gt_frames, gt_positions = load_gt_poses(GT_PATH)
-    frame_files = list_frames(FRAMES_DIR, ext="png")
-    print("GT rows:", len(gt_frames))
-    print("GT frame min/max:", int(np.min(gt_frames)), int(np.max(gt_frames)))
-    print("GT first/last positions:", gt_positions[0], gt_positions[-1])
+if not os.path.exists(VIDEO_PATH):
+    raise FileNotFoundError(VIDEO_PATH)
 
-    def idx_from_path(p):
-      return int(os.path.splitext(os.path.basename(p))[0])
+cap = cv2.VideoCapture(VIDEO_PATH)
 
-    img_idxs = np.array([idx_from_path(f) for f in frame_files], dtype=int)
-    print("IMG count:", len(frame_files))
-    print("IMG idx min/max:", int(img_idxs.min()), int(img_idxs.max()))
-    gt_set = set(map(int, gt_frames))
-    missing = [i for i in img_idxs[:200] if i not in gt_set]  # sample first 200
-    print("Missing GT (sample first 200):", missing[:20], "count:", len(missing))
+# 1. Read the very first frame just to get camera matrix dimensions
+ok, first_frame_ref = cap.read()
+if not ok:
+    raise RuntimeError("Could not read video")
 
-    K = build_camera_matrix_from_first_frame(frame_files[0])
-    estimator = MotionEstimator(camera_matrix=K)
+K = build_rough_camera_matrix(first_frame_ref.shape)
+dist = np.zeros((5, 1))
 
-    est_xyz, gt_xyz = integrate_trajectory(
-        estimator,
-        frame_files,
-        gt_frames,
-        gt_positions,
-        use_gt_scale=(not USE_GT_SCALE),
-        max_pairs=MAX_PAIRS,
-        verbose=VERBOSE
-    )
+estimator = MotionEstimator(camera_matrix=K)
 
-    # Save for later inspection
-    out_est = os.path.join(FRAMES_DIR, "estimated_trajectory_xyz.txt")
-    out_gt = os.path.join(FRAMES_DIR, "gt_trajectory_xyz_aligned.txt")
-    np.savetxt(out_est, est_xyz, fmt="%.9f", header="x y z")
-    np.savetxt(out_gt, gt_xyz, fmt="%.9f", header="x y z")
-    print(f"[OK] Saved:\n  {out_est}\n  {out_gt}")
+aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+aruco_params = cv2.aruco.DetectorParameters()
+aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-    plot_3d(gt_xyz, est_xyz)
+marker_length_m = (ARUCO_TOTAL_CELLS * ARUCO_CELL_CM) / 100.0
+
+# Reset video to start
+cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+# Variables for the main loop
+T_w_c = np.eye(4)
+vo_positions = []
+aruco_positions = []
+
+prev_frame = None
+prev_aruco = None
+last_scale = 1.0   # Default scale if we can't find ArUco immediately
+
+frame_counter = 0
+used_frames = 0
+
+print("Initializing: Searching for first ArUco marker to align origins...")
+
+# --- PHASE 1: INITIALIZATION LOOP ---
+# We read frames until we find the first ArUco marker.
+# This sets the starting point for both VO and ArUco paths.
+start_frame_idx = 0
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        print("Error: Video ended before finding any ArUco marker.")
+        exit()
+        
+    aruco_pos = detect_aruco_camera_center(frame, aruco_detector, K, dist, marker_length_m, wanted_id=ARUCO_ID)
+    
+    if aruco_pos is not None:
+        print(f"Locked on ArUco at frame {start_frame_idx}. Starting VO...")
+        
+        # Initialize VO start point to match the specific ArUco location
+        T_w_c[:3, 3] = aruco_pos
+        
+        # Save first points
+        vo_positions.append(aruco_pos)
+        aruco_positions.append(aruco_pos)
+        
+        # Set previous state for the next iteration
+        prev_frame = frame
+        prev_aruco = aruco_pos
+        
+        frame_counter = start_frame_idx
+        break
+        
+    start_frame_idx += 1
 
 
-if __name__ == "__main__":
-    main()
+# --- PHASE 2: MAIN TRACKING LOOP ---
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+
+    frame_counter += 1
+    
+    # Skip frames if configured
+    if FRAME_SKIP > 1 and (frame_counter - start_frame_idx) % FRAME_SKIP != 0:
+        continue
+
+    # 1. Detect ArUco (Ground Truth)
+    aruco_pos = detect_aruco_camera_center(frame, aruco_detector, K, dist, marker_length_m, wanted_id=ARUCO_ID)
+    
+    if aruco_pos is not None:
+        aruco_positions.append(aruco_pos)
+    else:
+        # If we lose the marker, we just visualize a gap in the orange line, 
+        # or you could append the last known position (optional)
+        pass
+
+    # 2. Estimate Visual Odometry (VO)
+    try:
+        result = estimator.estimate_motion(prev_frame, frame)
+    except Exception as e:
+        print(f"VO Failed at frame {frame_counter}: {e}")
+        prev_frame = frame
+        prev_aruco = aruco_pos if aruco_pos is not None else prev_aruco
+        continue
+
+    R = result["rotation_matrix"]
+    t = result["translation_vector"].reshape(3, 1)
+    
+    # Normalize translation direction (since monocular VO has no scale)
+    t_dir = t / (np.linalg.norm(t) + 1e-9)
+
+    # 3. Calculate Scale intelligently
+    # Only update scale if the drone actually moved enough to get a clean reading.
+    # Threshold: 2 cm (0.02 meters)
+    if prev_aruco is not None and aruco_pos is not None:
+        dist_moved = np.linalg.norm(aruco_pos - prev_aruco)
+        if dist_moved > 0.02:
+            last_scale = dist_moved
+
+    # Apply the scale (either fresh or carried over)
+    t_scaled = last_scale * t_dir
+
+    # 4. Update Pose
+    # FIX: Use simple multiplication (T_rel), NOT inverse
+    T_rel = se3_to_T(R, t_scaled)
+    T_w_c = T_w_c @ T_rel
+
+    vo_positions.append(T_w_c[:3, 3].copy())
+
+    # 5. Prepare for next step
+    prev_frame = frame
+    
+    # Only update prev_aruco if we actually saw it this frame
+    if aruco_pos is not None:
+        prev_aruco = aruco_pos
+        
+    used_frames += 1
+    if MAX_FRAMES > 0 and used_frames >= MAX_FRAMES:
+        break
+
+cap.release()
+
+vo_positions = np.asarray(vo_positions)
+aruco_positions = np.asarray(aruco_positions)
+
+print("Processing Complete.")
+print(f"VO points: {len(vo_positions)}")
+print(f"ArUco points: {len(aruco_positions)}")
+
+plot_trajectories(vo_positions, aruco_positions)
